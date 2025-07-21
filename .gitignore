@@ -23,3 +23,28 @@ cache/
 .vscode/
 .idea/
 *.swp
+
+# Backup files
+*.backup
+*.backup.*
+*_backup_*
+*.bak
+*.bkup
+*BACKUP*
+*CASINO_BACKUP*
+*_BACKUP
+*.save
+
+# SQL dumps
+*.sql
+recovery_*.sql
+backup_*.sql
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*temp*
+*tmp*
+*TEMP*
