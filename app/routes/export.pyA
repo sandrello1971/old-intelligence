@@ -1,0 +1,32 @@
+from fastapi import APIRouter, Depends
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+from io import StringIO
+from datetime import datetime
+from app.core.database import get_db
+from app.models.ticket import Ticket
+from app.models.task import Task
+
+router = APIRouter(prefix="/export", tags=["export"])
+
+@router.get("/tasks/obsidian")
+def export_tasks_obsidian(db: Session = Depends(get_db)):
+    buffer = StringIO()
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    tasks = db.query(Task).join(Ticket).filter(Task.status != "chiuso").all()
+
+    for task in tasks:
+        owner = task.owner or "Anonimo"
+        nome_tag = f"#{owner.replace(' ', '')}"
+        due_date = task.ticket.due_date.date().isoformat() if task.ticket and task.ticket.due_date else today
+        title = task.title or "Task senza titolo"
+        line = f"{title} - {nome_tag} priorità medium 📅 {due_date}\n"
+        buffer.write(line)
+
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer,
+        media_type="text/markdown",
+        headers={"Content-Disposition": "attachment; filename=Ticketing_Tasks.md"}
+    )

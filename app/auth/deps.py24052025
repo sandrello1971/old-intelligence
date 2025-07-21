@@ -1,0 +1,19 @@
+from fastapi import Depends, HTTPException
+from sqlalchemy.orm import Session
+from app.core.database import get_db
+from app.models.owner import Owner
+from app.auth.google import get_current_user
+
+def get_current_owner_user(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+) -> Owner:
+    user_email = current_user.get("email")
+    if not user_email:
+        raise HTTPException(status_code=401, detail="Email non disponibile nel token")
+
+    user = db.query(Owner).filter(Owner.email == user_email).first()
+    if not user:
+        raise HTTPException(status_code=403, detail="Utente non trovato nel database")
+
+    return user

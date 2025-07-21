@@ -1,0 +1,219 @@
+from datetime import datetime
+from app.services.crm_parser import extract_opportunities_from_description, extract_services_from_description
+from integrations.crm_incloud.opportunity import create_crm_opportunity
+from integrations.crm_incloud.activity import create_crm_activity
+from app.models.ticket import Ticket
+from app.models.company import Company
+from app.models.opportunity import Opportunity
+from app.models.activity import Activity
+from app.models.milestone import Milestone
+from app.models.phase_template import PhaseTemplate
+from app.models.task import Task
+from app.core.database import SessionLocal
+from app.services.i24_commessa import create_commessa_from_activity
+from pprint import pprint
+import json
+
+DEFAULT_ACTIVITY_SUBTYPE = 63688
+DEFAULT_ACTIVITY_PRIORITY = 0
+DEFAULT_ACTIVITY_STATE = 2
+
+def create_and_sync_opportunities(ticket: Ticket, db_session=None):
+    if db_session is None:
+        db_session = SessionLocal()
+
+    if not ticket.customer_name:
+        raise Exception(f"Ticket ID {ticket.id} - Manca il nome dell'azienda.")
+
+    if not ticket.owner:
+        raise Exception(f"Ticket ID {ticket.id} - Manca l'owner.")
+
+    if not ticket.activity:
+        raise Exception(f"Ticket ID {ticket.id} - Nessuna attività collegata.")
+
+    open_tasks = db_session.query(Task).filter(Task.ticket_id == ticket.id, Task.status != "chiuso").all()
+    if open_tasks:
+        raise Exception(f"Ticket ID {ticket.id} - Task ancora aperti: {[t.title for t in open_tasks]}")
+
+    company = db_session.query(Company).filter(Company.nome == ticket.customer_name.strip()).first()
+    if not company:
+        raise Exception(f"Azienda '{ticket.customer_name}' non trovata.")
+
+    services = ticket.activity.detected_services or []
+
+    if isinstance(services, str):
+        try:
+            services = json.loads(services)
+        except json.JSONDecodeError:
+            services = services.replace("{", "").replace("}", "").replace('"', '').split(",")
+            services = [s.strip() for s in services if s.strip()]
+
+    created = []
+
+    for service in services:
+        extracted_codes = extract_opportunities_from_description("", [service])
+        if not extracted_codes:
+            print(f"⚠️ Nessun codice rilevato per servizio: {service}")
+            continue
+
+        opp_code = extracted_codes[0]
+        opportunity_code = f"{opp_code}-{ticket.id}"
+
+        existing = db_session.query(Opportunity).filter(
+            Opportunity.codice == opportunity_code,
+            Opportunity.cliente == ticket.customer_name
+        ).first()
+        if existing:
+            print(f"⏭ Opportunità già esistente: {opportunity_code}")
+            continue
+
+        payload = {
+            "title": f"[{opp_code}] - {ticket.customer_name}",
+            "crossId": company.id,
+            "ownerId": int(ticket.activity.accompagnato_da) if ticket.activity.accompagnato_da else int(ticket.owner_id),
+            "salesPersons": [int(ticket.activity.owner_id) if ticket.activity.owner_id else int(ticket.owner_id)],
+            "description": f"Opportunità per servizio {opp_code}. Origine ticket: {ticket.ticket_code}",
+            "phase": 53002,
+            "category": 25309,
+            "status": 1,
+            "budget": 0,
+            "amount": 0,
+            "closeDate": datetime.utcnow().isoformat(),
+            "code": opportunity_code
+        }
+
+        print("📤 Payload opportunità:", payload)
+        response = create_crm_opportunity(payload)
+        if not response or not isinstance(response, (int, str)):
+            raise Exception(f"Errore CRM: risposta non valida ({response})")
+
+        opportunity_id = int(response)
+
+        local_opportunity = Opportunity(
+            id=opportunity_id,
+            titolo=payload["title"],
+            cliente=ticket.customer_name,
+            descrizione=payload["description"],
+            stato=payload["status"],
+            fase=payload["phase"],
+            probabilita=0,
+            data_chiusura=payload["closeDate"],
+            data_creazione=datetime.utcnow(),
+            data_modifica=datetime.utcnow(),
+            proprietario=ticket.owner,
+            commerciale=ticket.owner_id,
+            codice=opportunity_code,
+            categoria=payload["category"],
+            ammontare=payload["amount"]
+        )
+
+        db_session.add(local_opportunity)
+        db_session.commit()
+
+        created.append({
+            "opportunity": opportunity_code,
+            "opportunity_id": opportunity_id,
+            "opportunity_title": payload["title"],
+            "ticket_id": ticket.id
+        })
+
+    return {"created_opportunities": created, "count": len(created)}
+
+def generate_activities_from_opportunity(opportunity_id: int, db_session=None):
+    print(f"🔁 Avvio generazione attività da opportunità ID: {opportunity_id}")
+    if db_session is None:
+        db_session = SessionLocal()
+
+    opportunity = db_session.query(Opportunity).filter(Opportunity.id == opportunity_id).first()
+    if not opportunity:
+        raise Exception(f"Opportunità con ID {opportunity_id} non trovata.")
+
+    company = db_session.query(Company).filter(Company.nome == opportunity.cliente).first()
+    if not company:
+        raise Exception(f"Azienda '{opportunity.cliente}' non trovata.")
+
+    opp_code = opportunity.codice.split("-")[0]
+    milestones = db_session.query(Milestone).filter(Milestone.project_type == opp_code).order_by(Milestone.order).all()
+
+    created_activities = []
+    for i, milestone in enumerate(milestones, start=1):
+        activity = Activity(
+            opportunity_id=opportunity.id,
+            milestone_id=milestone.id,
+            project_type=opp_code,
+            company_id=company.id,
+            status="aperta",
+            sub_type_id=DEFAULT_ACTIVITY_SUBTYPE,
+            accompagnato_da=str(opportunity.commerciale),
+            accompagnato_da_nome=opportunity.proprietario
+        )
+        db_session.add(activity)
+        db_session.flush()
+
+        activity.detected_services = extract_services_from_description(opportunity.descrizione or "")
+        print(f"🚀 Servizi estratti: {activity.detected_services}")
+
+        suffix = str(activity.id)[-4:]
+        ticket_code = f"TCK-{opp_code}-{suffix}-{i:02}"
+
+        payload = {
+            "title": milestone.name,
+            "activityDate": datetime.utcnow().isoformat(),
+            "activityEndDate": datetime.utcnow().isoformat(),
+            "allDay": False,
+            "classification": 0,
+            "commercial": False,
+            "companyId": company.id,
+            "createdById": int(opportunity.commerciale),
+            "createdDate": datetime.utcnow().isoformat(),
+            "duration": 0,
+            "opportunityId": opportunity.id,
+            "ownerId": int(opportunity.commerciale),
+            "priority": DEFAULT_ACTIVITY_PRIORITY,
+            "state": DEFAULT_ACTIVITY_STATE,
+            "subject": f"{milestone.name} ({milestone.project_type})",
+            "description": f"Attività generata da milestone '{milestone.name}' – Codice ticket: {ticket_code}",
+            "toDo": 0,
+            "type": 7,
+            "subTypeId": DEFAULT_ACTIVITY_SUBTYPE,
+            "idCompanion": int(opportunity.commerciale)
+        }
+
+        print("📤 Payload attività CRM:")
+        pprint(payload)
+        try:
+            crm_result = create_crm_activity(payload)
+            print(f"🟢 Attività CRM creata: {crm_result}")
+            activity.id = int(crm_result)
+        except Exception as e:
+            print(f"❌ Errore attività CRM: {e}")
+
+        ticket = Ticket(
+            activity_id=activity.id,
+            ticket_code=ticket_code,
+            title=f"{milestone.name} - {ticket_code}",
+            description="Creato da fasi CRM",
+            customer_name=company.nome,
+            priority=2,
+            status=0,
+            owner=opportunity.proprietario,
+            owner_id=opportunity.commerciale
+        )
+        db_session.add(ticket)
+        db_session.flush()
+
+        tasks = db_session.query(PhaseTemplate).filter(PhaseTemplate.milestone_id == milestone.id).all()
+        for task in tasks:
+            task_entry = Task(
+                title=task.description,
+                ticket_id=ticket.id,
+                status="aperto",
+                priority="media",
+                owner=opportunity.commerciale
+            )
+            db_session.add(task_entry)
+
+        created_activities.append(activity.id)
+
+    db_session.commit()
+    return {"created_activities": created_activities}

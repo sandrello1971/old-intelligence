@@ -1,0 +1,21 @@
+from pydantic import BaseModel
+from typing import Optional
+
+class MilestoneBase(BaseModel):
+    name: str
+    project_type: str
+    order: int
+
+class MilestoneCreateSchema(MilestoneBase):
+    pass
+
+class MilestoneUpdateSchema(BaseModel):
+    name: Optional[str] = None
+    project_type: Optional[str] = None
+    order: Optional[int] = None
+
+class MilestoneSchema(MilestoneBase):
+    id: int
+
+    class Config:
+        from_attributes = True  # se usi Pydantic v2

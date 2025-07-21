@@ -1,0 +1,111 @@
+import os
+from dotenv import load_dotenv
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, text
+from app.models.activity import Activity
+from app.models.ticket import Ticket
+from app.models.task import Task
+from app.models.milestone import Milestone
+from app.models.phase_template import PhaseTemplate
+
+# ========== CONFIG ==========
+load_dotenv("/app/.env")
+
+DB_HOST = os.getenv("POSTGRES_HOST", "db")
+DB_URL = f"postgresql://{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}@{DB_HOST}:5432/{os.getenv('POSTGRES_DB')}"
+
+# ========== DB SETUP ==========
+engine = create_engine(DB_URL)
+Session = sessionmaker(bind=engine)
+session = Session()
+
+# ========== FUNZIONE PRINCIPALE ==========
+def generate_m24_tickets():
+    print("\n🚀 Avvio generazione ticket e task per attività 'Ulisse'...")
+
+    milestone = session.query(Milestone).filter_by(name="Firma M24").first()
+    if not milestone:
+        milestone = Milestone(name="Firma M24", project_type="M24", order=1)
+        session.add(milestone)
+        session.commit()
+        print("📌 Milestone 'Firma M24' creata.")
+
+    # Carica le fasi per M24 dalla tabella phase_templates
+    phase_templates = session.query(PhaseTemplate).filter_by(code="M24").order_by(PhaseTemplate.id).all()
+    phase_titles = [p.description for p in phase_templates]
+
+    activities = session.query(Activity).filter(Activity.activity_type.ilike("%Ulisse%"))
+    created = 0
+
+    for activity in activities:
+        # Controlla se l'attività ha già ticket associati (ricerca più robusta)
+        existing_ticket = session.query(Ticket).filter_by(activity_id=activity.id).first()
+        if existing_ticket:
+            print(f"⚠️ Ticket già esistente per attività {activity.id}, skip.")
+            continue
+
+        # Trova ticket_code univoco
+        base_code = f"TKC-M24-{str(activity.id)[-4:]}"
+        suffix = 1
+        while True:
+            ticket_code = f"{base_code}-{suffix}"
+            conflict = session.query(Ticket).filter_by(ticket_code=ticket_code).first()
+            if not conflict:
+                break
+            suffix += 1
+
+        owner_name = activity.accompagnato_da or "AI"
+        owner_id = session.execute(
+            text("SELECT id FROM owners WHERE CONCAT(name, ' ', surname) = :full_name"),
+            {"full_name": owner_name}
+        ).scalar()
+
+        if not owner_id:
+            print(f"⚠️ Owner '{owner_name}' non trovato per attività {activity.id}. Uso owner di default.")
+            owner_name = "AI"
+            owner_id = session.execute(
+                text("SELECT id FROM owners WHERE surname = 'AI'"),
+            ).scalar()
+
+        ticket = Ticket(
+            activity_id=activity.id,
+            ticket_code=ticket_code,
+            title=f"Ticket Ulisse per {activity.customer_name}",
+            description=activity.description or "",
+            priority=1,
+            status=0,
+            owner=owner_name,
+            milestone_id=milestone.id,
+            gtd_type="",
+            customer_name=activity.customer_name  # 🔥 AGGIUNGI QUESTO
+
+        )
+        session.add(ticket)
+        session.commit()
+
+        previous_task = None
+        for phase_title in phase_titles:
+            task = Task(
+                ticket_id=ticket.id,
+                title=f"{ticket_code} - {phase_title}",
+                description=f"Fase '{phase_title}' per il progetto Ulisse.",
+                priority="bassa",
+                status="aperto",
+                milestone_id=milestone.id,
+                owner=owner_id,
+                predecessor_id=previous_task.id if previous_task else None
+            )
+            session.add(task)
+            session.commit()
+            previous_task = task
+
+        session.commit()
+
+        print(f"✅ Ticket {ticket_code} e task creati per attività {activity.id}")
+        created += 1
+
+    print(f"\n📅 Completato: creati {created} ticket e relativi task per attività Ulisse.")
+
+# ========== MAIN ==========
+if __name__ == "__main__":
+    generate_m24_tickets()

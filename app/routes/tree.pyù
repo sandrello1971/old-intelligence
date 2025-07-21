@@ -1,0 +1,67 @@
+# app/routes/tree.py
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session, joinedload
+from app.core.database import get_db
+from app.models.ticket import Ticket
+from app.models.task import Task
+from app.models.activity import Activity
+
+router = APIRouter(prefix="/treeview", tags=["treeview"])
+
+@router.get("/companies")
+def get_company_tree(db: Session = Depends(get_db)):
+    # Carica tutti i ticket e i task
+    tickets = db.query(Ticket).options(joinedload(Ticket.tasks)).all()
+
+    companies = {}
+
+    for ticket in tickets:
+        customer_name = ticket.customer_name or "(Sconosciuto)"
+
+        if customer_name not in companies:
+            companies[customer_name] = {
+                "name": customer_name,
+                "commessa": None,
+                "opportunities": []
+            }
+
+        # Identifica se il ticket è un incarico o un'opportunità
+        if ticket.ticket_code.startswith("TKC-M24"):  # Commessa M24
+            if not companies[customer_name]["commessa"]:
+                companies[customer_name]["commessa"] = {
+                    "title": f"Commessa Incarico 24 mesi per {customer_name}",
+                    "tickets": []
+                }
+            companies[customer_name]["commessa"]["tickets"].append({
+                "ticket_code": ticket.ticket_code,
+                "tasks": [{"id": t.id, "title": t.title} for t in ticket.tasks]
+            })
+        else:
+            # Opportunità: infila in una lista apposita
+            opportunity_type = extract_opportunity_code(ticket.ticket_code)
+            found = False
+            for opp in companies[customer_name]["opportunities"]:
+                if opp["opportunity_code"] == opportunity_type:
+                    opp["tickets"].append({
+                        "ticket_code": ticket.ticket_code,
+                        "tasks": [{"id": t.id, "title": t.title} for t in ticket.tasks]
+                    })
+                    found = True
+                    break
+            if not found:
+                companies[customer_name]["opportunities"].append({
+                    "opportunity_code": opportunity_type,
+                    "title": f"Opportunità {opportunity_type} - {customer_name}",
+                    "tickets": [{
+                        "ticket_code": ticket.ticket_code,
+                        "tasks": [{"id": t.id, "title": t.title} for t in ticket.tasks]
+                    }]
+                })
+
+    return list(companies.values())
+
+def extract_opportunity_code(ticket_code: str) -> str:
+    if "-" in ticket_code:
+        return ticket_code.split("-")[0]
+    return "ALTRO"

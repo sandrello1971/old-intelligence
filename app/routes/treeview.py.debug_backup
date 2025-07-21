@@ -1,0 +1,93 @@
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session, joinedload
+from app.core.database import get_db
+from app.models.ticket import Ticket
+from app.models.task import Task
+from app.models.phase_template import PhaseTemplate
+from app.models.activity import Activity
+
+router = APIRouter(tags=["treeview"])
+
+@router.get("/treeview/companies")
+def get_company_treeview(db: Session = Depends(get_db)):
+    tickets = db.query(Ticket).options(
+        joinedload(Ticket.tasks),
+        joinedload(Ticket.activity),
+        joinedload(Ticket.milestone)
+    ).all()
+
+    task_order_map = {
+        pt.description: pt.order for pt in db.query(PhaseTemplate).all()
+    }
+
+    companies = {}
+
+    for ticket in tickets:
+        company_name = ticket.customer_name or "(Sconosciuto)"
+        if company_name not in companies:
+            companies[company_name] = {"commessa": None, "opportunities": []}
+
+        ordered_tasks = sorted(
+            ticket.tasks,
+            key=lambda t: (task_order_map.get(t.title, 9999), t.id)
+        )
+
+        task_list = [
+            {
+                "id": t.id,
+                "title": t.title,
+                "status": t.status,
+                "priority": t.priority,
+                "order": task_order_map.get(t.title, 9999)
+            } for t in ordered_tasks
+        ]
+
+        ticket_data = {
+            "id": ticket.id,
+            "ticket_code": ticket.ticket_code,
+            "gtd_type": ticket.gtd_type,
+            "status": ticket.status,
+            "priority": ticket.priority,
+            "milestone": {
+                "id": ticket.milestone.id if ticket.milestone else None,
+                "name": ticket.milestone.name if ticket.milestone else None,
+                "order": ticket.milestone.order if ticket.milestone else 999,
+            } if ticket.milestone else None,
+            "activity": {
+                "id": ticket.activity.id if ticket.activity else None,
+                "description": ticket.activity.description if ticket.activity else None,
+            },
+            "tasks": task_list
+        }
+
+        if ticket.gtd_type == "I24":
+            if not companies[company_name]["commessa"]:
+                companies[company_name]["commessa"] = {
+                    "title": f"Commessa Incarico 24 mesi per {company_name}",
+                    "tickets": []
+                }
+            companies[company_name]["commessa"]["tickets"].append(ticket_data)
+        else:
+            opp_code = ticket.gtd_type or "Opportunità"
+            opportunity = next(
+                (o for o in companies[company_name]["opportunities"] if o["opportunity_code"] == opp_code),
+                None
+            )
+            if not opportunity:
+                opportunity = {
+                    "opportunity_code": opp_code,
+                    "title": f"{opp_code} - {company_name}",
+                    "tickets": []
+                }
+                companies[company_name]["opportunities"].append(opportunity)
+
+            opportunity["tickets"].append(ticket_data)
+
+    return [
+        {
+            "name": company,
+            "commessa": data["commessa"],
+            "opportunities": data["opportunities"]
+        }
+        for company, data in companies.items()
+    ]

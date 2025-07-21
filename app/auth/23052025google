@@ -1,0 +1,57 @@
+from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Request
+from fastapi.responses import RedirectResponse
+from authlib.integrations.starlette_client import OAuth
+import os
+
+router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+# Configura OAuth
+oauth = OAuth()
+oauth.register(
+    name="google",
+    client_id=os.getenv("GOOGLE_CLIENT_ID"),
+    client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+    client_kwargs={"scope": "openid email profile"},
+)
+
+# Endpoint: avvia login
+@router.get("/login")
+async def login(request: Request):
+    next_url = request.query_params.get("next", "/dashboard")
+    redirect_uri = request.url_for("auth_callback")
+    return await oauth.google.authorize_redirect(request, redirect_uri, state=next_url)
+
+# Endpoint: riceve callback
+@router.get("/callback")
+async def auth_callback(request: Request):
+    token = await oauth.google.authorize_access_token(request)
+    
+    userinfo = token.get("userinfo")
+    if not userinfo:
+        resp = await oauth.google.get("userinfo", token=token)
+        userinfo = resp.json()
+
+    jwt_token = token.get("id_token")
+
+    # ✅ Ora next_url viene da state (inviato prima)
+    next_url = request.query_params.get("state", "/dashboard")
+
+    html = f"""
+    <html>
+      <head>
+        <script>
+          localStorage.setItem("google_token", "{jwt_token}");
+          window.location.href = "{next_url}";
+        </script>
+      </head>
+      <body>Redirecting...</body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+@router.get("/logout")
+async def logout(request: Request):
+    request.session.pop("user", None)
+    return RedirectResponse(url="/")

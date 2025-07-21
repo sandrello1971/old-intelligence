@@ -1,0 +1,23 @@
+# Backup dell'attuale config.py e aggiunta configurazione SMTP
+
+import os
+from typing import Optional
+
+# Mantieni tutte le configurazioni esistenti
+# Aggiungi solo la configurazione SMTP
+
+# SMTP Configuration per notifiche email
+SMTP_SERVER = os.getenv("SMTP_SERVER", "ssl0.ovh.net")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "intellivoice@enduser-digital.com")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")  # Da impostare nelle variabili d'ambiente
+SMTP_USE_TLS = True
+
+# Email settings
+DEFAULT_FROM_EMAIL = "intellivoice@enduser-digital.com"
+ESCALATION_EMAIL = "c.persico@enduser-italia.com"
+
+# Notification settings
+ENABLE_EMAIL_NOTIFICATIONS = os.getenv("ENABLE_EMAIL_NOTIFICATIONS", "true").lower() == "true"
+SLA_WARNING_DAYS = int(os.getenv("SLA_WARNING_DAYS", "2"))
+SLA_CHECK_HOURS = os.getenv("SLA_CHECK_HOURS", "09:00,14:00,17:00").split(",")

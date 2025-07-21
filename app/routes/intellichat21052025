@@ -1,0 +1,84 @@
+from fastapi import APIRouter, HTTPException, Request, Depends
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+from app.core.database import get_db
+import os
+from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
+router = APIRouter(tags=["chatbot"])
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+PROMPT_TEMPLATE = """
+Agisci come un esperto di SQL per PostgreSQL.
+
+Riceverai una domanda in linguaggio naturale riguardante un database, e il tuo compito è:
+
+1. Tradurre la domanda in una singola query SQL valida per PostgreSQL.
+2. NON usare comandi di scrittura (NO INSERT, UPDATE, DELETE, DROP).
+3. Genera SOLO query SELECT valide.
+4. NON ipotizzare filtri temporali se non espressamente richiesti.
+5. I valori di campo come "status" o "priority" sono numerici, usa il glossario sotto.
+6. Rispondi solo con la query SQL, **senza spiegazioni, preamboli o etichette**.
+
+📘 Glossario:
+- tickets.status: 0 = aperto, 1 = sospeso, 2 = chiuso
+- tickets.priority: 0 = bassa, 1 = media, 2 = alta
+- tasks.status / priority: stesso schema
+
+📊 Esempio:
+Domanda: Quanti ticket ad alta priorità?
+Risposta:
+SELECT COUNT(*) FROM tickets WHERE priority = 2;
+
+Domanda: {}
+"""
+
+@router.post("/query")
+async def natural_language_query(request: Request, db: Session = Depends(get_db)):
+    body = await request.json()
+    question = body.get("question")
+    if not question:
+        raise HTTPException(status_code=400, detail="Missing question")
+
+    prompt = PROMPT_TEMPLATE.format(question.strip())
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+        raw_reply = response.choices[0].message.content.strip()
+
+        # 🧹 Sanitize SQL (rimuovi etichette tipo "Risposta:")
+        sql_code = raw_reply.strip()
+        if sql_code.lower().startswith("risposta:"):
+            sql_code = sql_code[len("risposta:"):].strip()
+
+        # 🚫 Validazione base
+        if not sql_code.lower().startswith("select"):
+            raise HTTPException(status_code=400, detail="Risposta non valida: non è una SELECT.")
+
+        # 🧠 Esecuzione SQL
+        result = db.execute(text(sql_code))
+        rows = result.fetchall()
+        headers = result.keys()
+
+        # 📈 Costruisci risposta naturale
+        if len(rows) == 1 and len(headers) == 1:
+            value = rows[0][0]
+            reply = f"La risposta alla tua domanda è: **{value}**."
+        else:
+            reply = f"Ecco i risultati:\n" + "\n".join(str(dict(zip(headers, row))) for row in rows)
+
+        return {
+            "sql": sql_code,
+            "data": [dict(zip(headers, row)) for row in rows],
+            "reply": reply
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore nel chatbot: {str(e)}")

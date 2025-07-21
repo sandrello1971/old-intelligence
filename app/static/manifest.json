@@ -1,0 +1,35 @@
+{
+  "name": "Intellivoice - AI Voice Assistant",
+  "short_name": "Intellivoice",
+  "description": "Assistente vocale intelligente con AI",
+  "start_url": "/intellivoice",
+  "display": "standalone",
+  "background_color": "#f57c00",
+  "theme_color": "#f57c00",
+  "orientation": "portrait",
+  "scope": "/intellivoice",
+  "icons": [
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "72x72 96x96 128x128 144x144 152x152 192x192 384x384 512x512",
+      "type": "image/svg+xml",
+      "purpose": "maskable any"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Avvia Registrazione",
+      "short_name": "Record",
+      "description": "Inizia una nuova registrazione vocale",
+      "url": "/intellivoice?action=record",
+      "icons": [
+        {
+          "src": "/icons/icon.svg",
+          "sizes": "192x192"
+        }
+      ]
+    }
+  ],
+  "categories": ["business", "productivity", "utilities"],
+  "lang": "it"
+}

@@ -1,0 +1,182 @@
+import os
+import re
+from datetime import datetime, timedelta
+from sqlalchemy.orm import Session
+from app.models.ticket import Ticket
+from app.models.task import Task
+from app.models.activity import Activity
+from app.models.service_user_association import ServiceUserAssociation
+from app.models.sub_type import SubType
+from process_code_map import PROCESS_CODE_MAP
+from integrations.crm_incloud.activity import create_crm_activity
+
+# ✅ FIX: Lazy loading OpenAI client per evitare errore all'import
+_openai_client = None
+
+def get_openai_client():
+    """Inizializza OpenAI client solo quando necessario"""
+    global _openai_client
+    if _openai_client is None:
+        try:
+            from openai import OpenAI
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                print("⚠️ OPENAI_API_KEY non configurata - funzioni AI disabilitate")
+                return None
+            _openai_client = OpenAI(api_key=api_key)
+        except Exception as e:
+            print(f"⚠️ Errore inizializzazione OpenAI: {e}")
+            return None
+    return _openai_client
+
+# Usa lazy loading invece di inizializzazione immediata
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4-turbo")
+
+STATUS_MAP = {"aperta": 0, "in corso": 1, "completata": 2}
+PRIORITY_CRM = {1: "High", 2: "Medium", 3: "Low"}
+
+DEFAULT_TASKS_I24 = [
+    "Predisposizione incarico",
+    "Invio incarico",
+    "Firma incarico"
+]
+
+SERVICE_LABELS = {
+    "F40": "Formazione 4.0",
+    "KHW": "Know How",
+    "T50": "Transizione 5.0",
+    "PBX": "Patent Box",
+    "CBK": "Cashback",
+    "FND": "Finanziamenti",
+    "BND": "Bandi",
+    "CLB": "Collaborazione",
+    "GEN": "Generico",
+    "ALT": "Altro",
+}
+
+def get_service_owner(service_code: str, db_session):
+    """Trova l'owner di un servizio dalle associazioni"""
+    try:
+        association = db_session.query(ServiceUserAssociation).join(
+            SubType, ServiceUserAssociation.service_id == SubType.id
+        ).filter(SubType.code == service_code).first()
+        
+        if association:
+            print(f"✅ Owner trovato per servizio {service_code}: {association.user_id}")
+            return association.user_id
+        else:
+            print(f"⚠️ Nessuna associazione trovata per servizio {service_code}")
+            return None
+    except Exception as e:
+        print(f"❌ Errore ricerca owner per {service_code}: {e}")
+        return None
+
+def gtd_priority_to_int(priority: str) -> int:
+    mapping = {"alta": 1, "media": 2, "bassa": 3}
+    return mapping.get(priority.lower().strip(), 2) if isinstance(priority, str) else 2
+
+def extract_project_codes_local(description: str) -> list[str]:
+    description_lower = description.lower()
+    matches = []
+    for key, code in PROCESS_CODE_MAP.items():
+        pattern = r'\b' + re.escape(key.lower()) + r'\b'
+        if re.search(pattern, description_lower):
+            matches.append(code)
+    print(f"[DEBUG] Progetti rilevati nella descrizione: {matches}")
+    return matches
+
+def update_activity_description_from_tasks(activity: Activity, db: Session):
+    tasks = db.query(Task).filter(Task.ticket.has(activity_id=activity.id)).all()
+    if not tasks:
+        return
+
+    summary_lines = [f"{t.title}: {t.description}" for t in tasks]
+
+    base_description = activity.description or ""
+    base_parts = base_description.split("||")
+    original_part = base_parts[0].strip() if base_parts else ""
+    updated_description = f"{original_part} || {' | '.join(summary_lines)}"
+
+    activity.description = updated_description
+    db.merge(activity)
+    db.commit()
+
+def update_activity_owner(activity: Activity, new_owner_id: int, db: Session):
+    if str(activity.accompagnato_da) != str(new_owner_id):
+        activity.accompagnato_da = str(new_owner_id)
+        db.merge(activity)
+        db.commit()
+        print(f"[INFO] Owner aggiornato per attività #{activity.id} → {new_owner_id}")
+
+def generate_tickets_from_activity(activity: Activity, db: Session, sync_mode: bool = False):
+    print(f"\n[INFO] Generazione ticket per attività #{activity.id}")
+    print(f"[INFO] Descrizione attività: {activity.description}")
+
+    suffix = str(activity.id)[-4:]
+    owner_id = activity.accompagnato_da
+
+    if int(activity.sub_type_id) == 63705:
+        print("[INFO] Attività di tipo 'Incarico 24 mesi' trovata. Creazione ticket e task direttamente.")
+
+        now = datetime.utcnow()
+        ticket_code = f"TCK-I24-{suffix}-00"
+        ticket = Ticket(
+            activity_id=activity.id,
+            ticket_code=ticket_code,
+            title=f"Incarico 24 mesi - {ticket_code}",
+            gtd_type="Project",
+            # 🔄 NUOVA LOGICA: Owner dinamico da associazioni
+        i24_owner_id = get_service_owner('I24', db)
+        if i24_owner_id:
+            # Trova nome utente dall'ID
+            from app.models.user import User
+            user = db.query(User).filter(User.id == i24_owner_id).first()
+            owner_name = f"{user.name} {user.surname}".strip() if user else "Owner I24"
+            actual_owner_id = i24_owner_id
+        else:
+            # Fallback alla logica originale
+            actual_owner_id = 120385  # Barbara fallback
+            owner_name = "Barbara Mercedes Romano"
+        
+        print(f"🎯 I24 Owner: {actual_owner_id} ({owner_name})")
+        
+        # Usa owner dinamico
+        owner_id=actual_owner_id,
+        owner=owner_name,
+            status=0,
+            priority=1,
+            description=activity.description,
+            customer_name=activity.customer_name,
+            created_at=now,
+            updated_at=now,
+            due_date=now + timedelta(days=3),
+            account=activity.owner_name,  # ⬅️ NEW: campo da aggiungere nel modello Ticket se non c'è
+            company_id=activity.company_id,
+            detected_services=activity.detected_services if activity.detected_services else [],
+        )
+        db.add(ticket)
+        db.flush()
+
+        for task_title in DEFAULT_TASKS_I24:
+            task = Task(
+                ticket_id=ticket.id,
+                title=task_title,
+                status="aperto",
+                priority="media",
+                owner=str(ticket.owner_id),
+                customer_name=ticket.customer_name,
+                description=task_title,
+                parent_id=None
+            )
+            db.add(task)
+
+        db.commit()
+        update_activity_description_from_tasks(activity, db)
+
+        print(f"[SUCCESS] Ticket e task creati per attività Incarico 24 mesi con codice: {ticket.ticket_code}")
+        return [ticket]
+
+    print("[INFO] Attività non di tipo 'Incarico 24 Mesi', logica non implementata.")
+    return []
+
+__all__ = ["generate_tickets_from_activity", "update_activity_owner"]

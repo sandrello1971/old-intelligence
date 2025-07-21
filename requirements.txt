@@ -1,0 +1,39 @@
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+
+# NLP / AI
+openai
+
+# Database
+sqlalchemy>=1.4
+psycopg2-binary
+
+# Web
+jinja2
+python-multipart
+requests
+python-dotenv
+python-dateutil
+
+# Auth
+authlib
+passlib[bcrypt]
+python-jose[cryptography]
+bcrypt
+PyJWT
+# Validation
+pydantic[email]>=2.1.0   # ⬅️ include anche email-validator!
+
+# Utils
+matplotlib
+pandas
+pandas>=2.0.0
+openpyxl>=3.1.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+aiosmtplib==3.0.1
+jinja2==3.1.2
+schedule==1.2.0
+aiosmtplib==3.0.1
+jinja2==3.1.2
+schedule==1.2.0

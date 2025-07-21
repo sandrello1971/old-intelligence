@@ -1,0 +1,263 @@
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from app.core.database import get_db
+from app.models.sub_type import SubType
+from app.models.milestone import Milestone  
+from app.models.phase_template import PhaseTemplate
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel
+import logging
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/services-tree", tags=["Services Tree"])
+
+# Pydantic models
+class MilestoneCreate(BaseModel):
+    name: str
+    order: int
+    sla_days: Optional[int] = 5
+    warning_days: Optional[int] = 2
+    escalation_days: Optional[int] = 3
+
+class TaskTemplateCreate(BaseModel):
+    code: str
+    type: str
+    description: str
+    order: Optional[int] = 1
+
+@router.get("/")
+async def get_services_tree(db: Session = Depends(get_db)):
+    """Restituisce l'alberatura completa dei servizi"""
+    try:
+        services = db.query(SubType).all()
+        result = []
+        
+        for service in services:
+            milestones = db.query(Milestone).filter(
+                Milestone.project_type == service.code
+            ).order_by(Milestone.order).all()
+            
+            milestones_data = []
+            for milestone in milestones:
+                task_templates = db.query(PhaseTemplate).filter(
+                    PhaseTemplate.milestone_id == milestone.id
+                ).order_by(PhaseTemplate.order).all()
+                
+                milestone_data = {
+                    "id": milestone.id,
+                    "name": milestone.name,
+                    "order": milestone.order,
+                    "project_type": milestone.project_type,
+                    "sla_days": 5,
+                    "warning_days": 2, 
+                    "escalation_days": 3,
+                    "task_templates": [
+                        {
+                            "id": template.id,
+                            "code": template.code,
+                            "type": template.type,
+                            "description": template.description,
+                            "order": getattr(template, 'order', 0),
+                            "parent_id": getattr(template, 'parent_id', None)
+                        }
+                        for template in task_templates
+                    ]
+                }
+                milestones_data.append(milestone_data)
+            
+            service_data = {
+                "id": service.id,
+                "name": service.name,
+                "code": service.code,
+                "description": getattr(service, 'description', ''),
+                "active": getattr(service, 'active', True),
+                "milestones": milestones_data
+            }
+            result.append(service_data)
+        
+        logger.info(f"✅ Caricati {len(result)} servizi")
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Errore: {e}")
+        return []
+
+@router.post("/services/{service_id}/milestones")
+async def create_milestone(service_id: int, milestone: MilestoneCreate, db: Session = Depends(get_db)):
+    """Crea una nuova milestone per un servizio"""
+    try:
+        service = db.query(SubType).filter(SubType.id == service_id).first()
+        if not service:
+            raise HTTPException(status_code=404, detail="Servizio non trovato")
+        
+        new_milestone = Milestone(
+            name=milestone.name,
+            project_type=service.code,
+            order=milestone.order
+        )
+        
+        db.add(new_milestone)
+        db.commit()
+        db.refresh(new_milestone)
+        
+        logger.info(f"✅ MILESTONE CREATA: {milestone.name} per {service.code}")
+        
+        return {
+            "id": new_milestone.id,
+            "name": new_milestone.name,
+            "order": new_milestone.order,
+            "project_type": new_milestone.project_type,
+            "sla_days": milestone.sla_days,
+            "warning_days": milestone.warning_days,
+            "escalation_days": milestone.escalation_days,
+            "message": f"Milestone creata con successo"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Errore creazione milestone: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.put("/milestones/{milestone_id}")
+async def update_milestone(milestone_id: int, milestone: MilestoneCreate, db: Session = Depends(get_db)):
+    """Aggiorna una milestone esistente"""
+    try:
+        db_milestone = db.query(Milestone).filter(Milestone.id == milestone_id).first()
+        if not db_milestone:
+            raise HTTPException(status_code=404, detail="Milestone non trovata")
+        
+        db_milestone.name = milestone.name
+        db_milestone.order = milestone.order
+        
+        db.commit()
+        db.refresh(db_milestone)
+        
+        return {
+            "id": db_milestone.id,
+            "name": db_milestone.name,
+            "order": db_milestone.order,
+            "message": "Milestone aggiornata con successo"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Errore aggiornamento: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/milestones/{milestone_id}")
+async def delete_milestone(milestone_id: int, db: Session = Depends(get_db)):
+    """Elimina milestone e task template collegati"""
+    try:
+        milestone = db.query(Milestone).filter(Milestone.id == milestone_id).first()
+        if not milestone:
+            raise HTTPException(status_code=404, detail="Milestone non trovata")
+        
+        linked_tasks = db.query(PhaseTemplate).filter(PhaseTemplate.milestone_id == milestone_id).count()
+        
+        db.query(PhaseTemplate).filter(PhaseTemplate.milestone_id == milestone_id).delete()
+        db.delete(milestone)
+        db.commit()
+        
+        return {
+            "message": f"Milestone eliminata con successo (eliminati anche {linked_tasks} task collegati)"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Errore eliminazione: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/milestones/{milestone_id}/templates")
+async def create_task_template(milestone_id: int, template: TaskTemplateCreate, db: Session = Depends(get_db)):
+    """Crea task template per milestone"""
+    try:
+        milestone = db.query(Milestone).filter(Milestone.id == milestone_id).first()
+        if not milestone:
+            raise HTTPException(status_code=404, detail="Milestone non trovata")
+        
+        new_template = PhaseTemplate(
+            code=template.code,
+            type=template.type,
+            description=template.description,
+            milestone_id=milestone_id,
+            order=template.order
+        )
+        
+        db.add(new_template)
+        db.commit()
+        db.refresh(new_template)
+        
+        return {
+            "id": new_template.id,
+            "code": new_template.code,
+            "description": new_template.description,
+            "message": "Task template creato con successo"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Errore creazione task: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.put("/templates/{template_id}")
+async def update_task_template(template_id: int, template: TaskTemplateCreate, db: Session = Depends(get_db)):
+    """Aggiorna task template"""
+    try:
+        db_template = db.query(PhaseTemplate).filter(PhaseTemplate.id == template_id).first()
+        if not db_template:
+            raise HTTPException(status_code=404, detail="Template non trovato")
+        
+        db_template.code = template.code
+        db_template.type = template.type
+        db_template.description = template.description
+        db_template.order = template.order
+        
+        db.commit()
+        db.refresh(db_template)
+        
+        return {
+            "id": db_template.id,
+            "description": db_template.description,
+            "message": "Task template aggiornato con successo"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Errore aggiornamento task: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/templates/{template_id}")
+async def delete_task_template(template_id: int, db: Session = Depends(get_db)):
+    """Elimina task template"""
+    try:
+        template = db.query(PhaseTemplate).filter(PhaseTemplate.id == template_id).first()
+        if not template:
+            raise HTTPException(status_code=404, detail="Template non trovato")
+        
+        db.delete(template)
+        db.commit()
+        
+        return {"message": "Task template eliminato con successo"}
+        
+    except Exception as e:
+        logger.error(f"❌ Errore eliminazione task: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/health")
+async def health_check():
+    """Health check"""
+    return {
+        "status": "ok", 
+        "message": "Router CRUD completo funzionante",
+        "endpoints": [
+            "GET / - Lista servizi",
+            "POST /services/{id}/milestones - Crea milestone", 
+            "PUT /milestones/{id} - Aggiorna milestone",
+            "DELETE /milestones/{id} - Elimina milestone",
+            "POST /milestones/{id}/templates - Crea task",
+            "PUT /templates/{id} - Aggiorna task",
+            "DELETE /templates/{id} - Elimina task"
+        ]
+    }

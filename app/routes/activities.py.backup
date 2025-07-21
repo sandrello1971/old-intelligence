@@ -1,0 +1,107 @@
+from typing import List
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session, joinedload
+from app.core.database import get_db
+from app.models.activity import Activity
+from app.schemas.activity import ActivitySchema, ActivityTreeSchema
+from app.models.ticket import Ticket
+
+router = APIRouter()
+
+def serialize_activity_tree(activities: List[Activity]) -> List[dict]:
+    tree = []
+
+    for activity in activities:
+        activity_dict = {
+            "id": activity.id,
+            "description": f"{activity.id} - {activity.customer_name or 'Azienda'} Incarico 24 mesi firmato",
+            "status": "open",  # stringa fissa o logica a parte
+            "tickets": [],
+        }
+
+        for ticket in activity.tickets:
+            ticket_dict = {
+                "id": ticket.id,
+                "ticket_code": ticket.ticket_code,
+                "title": f"{ticket.ticket_code} - {ticket.title}",
+                "status": str(ticket.status) if ticket.status is not None else "unknown",
+                "priority": str(ticket.priority) if ticket.priority is not None else "medium",
+                "gtd_type": str(ticket.gtd_type) if ticket.gtd_type is not None else "next_action",
+                "tasks": [],
+                "children": [],
+            }
+
+            for task in ticket.tasks:
+                task_dict = {
+                    "id": task.id,
+                    "title": task.title,
+                    "status": str(task.status) if task.status is not None else "unknown",
+                    "priority": str(task.priority) if task.priority is not None else "medium",
+                }
+                ticket_dict["tasks"].append(task_dict)
+
+            activity_dict["tickets"].append(ticket_dict)
+
+        tree.append(activity_dict)
+
+    return tree
+
+
+@router.get("/api/activities/tree", response_model=List[ActivityTreeSchema])
+def get_activity_tree(db: Session = Depends(get_db)):
+    activities = (
+        db.query(Activity)
+        .options(joinedload(Activity.tickets).joinedload(Ticket.tasks))
+        .all()
+    )
+
+    return serialize_activity_tree(activities)
+
+@router.get("/api/activities/{activity_id}", response_model=ActivitySchema)
+def get_activity(activity_id: int, db: Session = Depends(get_db)):
+    activity = db.query(Activity).filter(Activity.id == activity_id).first()
+    if not activity:
+        raise HTTPException(status_code=404, detail="Attività non trovata")
+
+    return {
+        "id": activity.id,
+        "description": activity.description,
+        "status": str(activity.status) if activity.status is not None else "unknown",
+        "priority": str(activity.priority) if activity.priority is not None else "-",
+        "due_date": activity.due_date.isoformat() if hasattr(activity.due_date, "isoformat") else activity.due_date or "-",
+        "owner_name": activity.owner_name or "-",
+        "accompagnato_da": activity.accompagnato_da or "-",
+        "company_name": activity.customer_name or "-",    # 👈 OK
+        "account_name": activity.account_name or "-"      # 👈 OK
+    }
+
+
+@router.patch("/api/activities/{activity_id}/services")
+def update_detected_services(activity_id: int, payload: dict, db: Session = Depends(get_db)):
+    activity = db.query(Activity).filter(Activity.id == activity_id).first()
+    if not activity:
+        raise HTTPException(status_code=404, detail="Attività non trovata")
+
+    services = payload.get("services", [])
+    if not isinstance(services, list):
+        raise HTTPException(status_code=400, detail="Formato servizi non valido, deve essere una lista")
+
+    # Salva come stringa separata da virgole
+    activity.detected_services = ", ".join(services)
+    db.commit()
+
+    return {"success": True, "saved_services": services}
+
+
+from fastapi import status
+from integrations.crm_incloud.sync import sync_single_activity
+
+@router.post("/activities/{activity_id}/sync", status_code=status.HTTP_200_OK)
+def sync_activity_from_crm(activity_id: int, db: Session = Depends(get_db)):
+    """
+    Sincronizza una singola attività dal CRM e la aggiorna nel DB locale.
+    """
+    activity = sync_single_activity(activity_id, session=db)
+    if not activity:
+        raise HTTPException(status_code=404, detail="Attività non trovata nel CRM o nel DB")
+    return {"success": True, "id": activity_id}

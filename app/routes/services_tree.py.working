@@ -1,0 +1,44 @@
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from app.core.database import get_db
+from app.models.sub_type import SubType
+from app.models.milestone import Milestone  
+from app.models.phase_template import PhaseTemplate
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel
+import logging
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/services-tree", tags=["Services Tree"])
+
+# Pydantic models
+class MilestoneCreate(BaseModel):
+    name: str
+    order: int
+    sla_days: Optional[int] = 5
+    warning_days: Optional[int] = 2
+    escalation_days: Optional[int] = 3
+
+class TaskTemplateCreate(BaseModel):
+    code: str
+    type: str
+    description: str
+    order: Optional[int] = 1
+
+@router.get("/health")
+async def health_check():
+    """Health check"""
+    return {
+        "status": "ok", 
+        "message": "Router CRUD completo funzionante",
+        "endpoints": [
+            "GET / - Lista servizi",
+            "POST /services/{id}/milestones - Crea milestone", 
+            "PUT /milestones/{id} - Aggiorna milestone",
+            "DELETE /milestones/{id} - Elimina milestone",
+            "POST /milestones/{id}/templates - Crea task",
+            "PUT /templates/{id} - Aggiorna task",
+            "DELETE /templates/{id} - Elimina task"
+        ]
+    }

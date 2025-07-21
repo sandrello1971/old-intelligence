@@ -1,0 +1,130 @@
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session, joinedload
+from app.core.database import get_db
+from app.models.ticket import Ticket
+from app.models.task import Task
+from app.models.activity import Activity
+from app.models.opportunity import Opportunity
+from app.models.milestone import Milestone
+from app.models.phase_template import PhaseTemplate
+
+router = APIRouter(prefix="/treeview", tags=["treeview"])
+
+@router.get("/companies")
+def get_company_tree(db: Session = Depends(get_db)):
+    tickets = db.query(Ticket).options(
+        joinedload(Ticket.tasks),
+        joinedload(Ticket.activity),
+        joinedload(Ticket.company),
+        joinedload(Ticket.milestone),
+    ).all()
+
+    # ✅ ORDINAMENTO TASK DA CONFIGURAZIONE ADMIN
+    task_order_map = {
+        pt.description: pt.order for pt in db.query(PhaseTemplate).all()
+    }
+
+    companies = {}
+
+    for ticket in tickets:
+        customer_name = (
+            ticket.customer_name or
+            (ticket.company.nome if ticket.company else None) or
+            "(Sconosciuto)"
+        )
+
+        if customer_name not in companies:
+            companies[customer_name] = {
+                "name": customer_name,
+                "commessa": None,
+                "opportunities": []
+            }
+
+        ticket_data = {
+            "id": ticket.id,
+            "ticket_code": ticket.ticket_code,
+            "title": ticket.title,
+            "customer_name": customer_name,
+            "gtd_generated": ticket.gtd_generated,
+            "milestone": {
+                "id": ticket.milestone.id if ticket.milestone else None,
+                "name": ticket.milestone.name if ticket.milestone else None
+            } if ticket.milestone else None,
+            "activity": {
+                "id": ticket.activity.id if ticket.activity else None,
+                "description": ticket.activity.description if ticket.activity else None,
+            },
+            "tasks": sorted([
+                {
+                    "id": t.id,
+                    "title": t.title,
+                    "status": t.status,
+                    "priority": t.priority,
+                    "order": task_order_map.get(t.title, 9999)
+                } for t in ticket.tasks
+            ], key=lambda x: x["order"] if x["order"] is not None else 9999)
+        }
+
+        # ✅ Se è I24 → crea commessa con le sue opportunità derivate
+        if ticket.ticket_code.startswith("TCK-I24"):
+            if not companies[customer_name]["commessa"]:
+                # ✅ CARICA OPPORTUNITÀ DERIVATE DA QUESTO I24
+                i24_id = ticket.id
+                derived_opportunities = []
+                
+                # Trova tutte le opportunità che derivano da questo I24
+                crm_opps = db.query(Opportunity).filter(Opportunity.cliente == customer_name).all()
+                for opp in crm_opps:
+                    # Controlla se l'opportunità deriva da questo I24
+                    if f"-{i24_id}" in opp.codice:
+                        has_activities = db.query(Activity).filter(Activity.opportunity_id == str(opp.id)).count() > 0
+                        
+                        # Trova i ticket derivati per questa opportunità
+                        derived_tickets = []
+                        for derived_ticket in tickets:
+                            if (derived_ticket.activity and 
+                                derived_ticket.activity.opportunity_id == str(opp.id)):
+                                
+                                derived_ticket_data = {
+                                    "id": derived_ticket.id,
+                                    "ticket_code": derived_ticket.ticket_code,
+                                    "title": derived_ticket.title,
+                                    "customer_name": derived_ticket.customer_name,
+                                    "gtd_generated": derived_ticket.gtd_generated,
+                                    "milestone": {
+                                        "id": derived_ticket.milestone.id if derived_ticket.milestone else None,
+                                        "name": derived_ticket.milestone.name if derived_ticket.milestone else None
+                                    } if derived_ticket.milestone else None,
+                                    "activity": {
+                                        "id": derived_ticket.activity.id if derived_ticket.activity else None,
+                                        "description": derived_ticket.activity.description if derived_ticket.activity else None,
+                                    },
+                                    "tasks": sorted([
+                                        {
+                                            "id": t.id,
+                                            "title": t.title,
+                                            "status": t.status,
+                                            "priority": t.priority,
+                                            "order": task_order_map.get(t.title, 9999)
+                                        } for t in derived_ticket.tasks
+                                    ], key=lambda x: x["order"] if x["order"] is not None else 9999)
+                                }
+                                derived_tickets.append(derived_ticket_data)
+                        
+                        derived_opportunities.append({
+                            "opportunity_code": opp.codice,
+                            "title": opp.titolo,
+                            "id": opp.id,
+                            "has_activities": has_activities,
+                            "tickets": derived_tickets
+                        })
+
+                companies[customer_name]["commessa"] = {
+                    "title": f"Commessa Incarico 24 mesi per {customer_name}",
+                    "tickets": [ticket_data],
+                    "opportunities": derived_opportunities
+                }
+            else:
+                companies[customer_name]["commessa"]["tickets"].append(ticket_data)
+
+    return list(companies.values())

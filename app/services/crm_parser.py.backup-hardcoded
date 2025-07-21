@@ -1,0 +1,54 @@
+def extract_opportunities_from_description(description: str, services: list[str] = None):
+    """
+    Estrae codici opportunità dalla descrizione e/o lista servizi.
+    """
+    mapping = {
+        "formazione 4.0": "F40",
+        "transizione 5.0": "T50",
+        "know how": "KHW",
+        "cashback": "CBK",
+        "patent box": "PBX",
+        # Estendibile per altri servizi
+    }
+
+    found = set()
+
+    if description:
+        description = description.lower()
+        for phrase, code in mapping.items():
+            if phrase in description:
+                found.add(code)
+
+    # Se forniti, anche i servizi rilevati
+    if services:
+        for label in services:
+            label = label.lower().strip()
+            for phrase, code in mapping.items():
+                if phrase in label:
+                    found.add(code)
+
+    return list(found)
+
+def extract_services_from_description(description: str) -> list[str]:
+    """
+    Ritorna un elenco di etichette di servizi riconosciute a partire dalla descrizione.
+    """
+    mapping = {
+        "formazione 4.0": "Formazione 4.0",
+        "transizione 5.0": "Transizione 5.0",
+        "know how": "Know How",
+        "cashback": "Cashback",
+        "patent box": "Patent Box",
+        # Puoi aggiungere altri
+    }
+
+    found = set()
+
+    if description:
+        description = description.lower()
+        for phrase, label in mapping.items():
+            if phrase in description:
+                found.add(label)
+
+    return list(found)
+

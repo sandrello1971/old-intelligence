@@ -1,0 +1,590 @@
+# app/routes/business_cards.py
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from pydantic import BaseModel, EmailStr
+from typing import List, Optional, Dict, Any
+import os
+import uuid
+import json
+import base64
+from datetime import datetime
+from PIL import Image
+import io
+import re
+from openai import OpenAI
+from app.core.database import get_db
+
+router = APIRouter(tags=["business_cards"])
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Configurazione
+MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10MB
+SUPPORTED_FORMATS = ["image/jpeg", "image/jpg", "image/png", "image/webp"]
+
+# Modelli Pydantic
+class BusinessCardData(BaseModel):
+    nome: Optional[str] = None
+    cognome: Optional[str] = None
+    nome_completo: Optional[str] = None
+    azienda: Optional[str] = None
+    posizione: Optional[str] = None
+    telefono: Optional[str] = None
+    cellulare: Optional[str] = None
+    email: Optional[str] = None
+    sito_web: Optional[str] = None
+    indirizzo: Optional[str] = None
+    citta: Optional[str] = None
+    cap: Optional[str] = None
+    paese: Optional[str] = None
+    linkedin: Optional[str] = None
+    altri_social: Optional[Dict[str, str]] = None
+    note: Optional[str] = None
+
+class BusinessCardResult(BaseModel):
+    id: str
+    filename: str
+    extracted_data: BusinessCardData
+    confidence_score: float
+    raw_text: Optional[str] = None
+    processing_time: float
+    created_at: datetime
+    status: str  # "success", "partial", "error"
+
+class ContactCreate(BaseModel):
+    business_card_id: Optional[str] = None
+    nome: str
+    cognome: str
+    azienda: Optional[str] = None
+    posizione: Optional[str] = None
+    telefono: Optional[str] = None
+    email: Optional[str] = None
+    note: Optional[str] = None
+
+class Contact(BaseModel):
+    id: int
+    nome: str
+    cognome: str
+    nome_completo: str
+    azienda: Optional[str]
+    posizione: Optional[str]
+    telefono: Optional[str]
+    email: Optional[str]
+    created_at: datetime
+    business_card_id: Optional[str]
+
+# Database setup
+def setup_business_cards_tables(db: Session):
+    """Crea tabelle per biglietti da visita se non esistono"""
+    try:
+        # Tabella biglietti da visita processati
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS business_cards (
+                id VARCHAR PRIMARY KEY,
+                filename VARCHAR NOT NULL,
+                image_data TEXT, -- Base64 dell'immagine
+                extracted_data JSONB, -- Dati estratti strutturati
+                raw_text TEXT, -- Testo grezzo OCR
+                confidence_score FLOAT DEFAULT 0.0,
+                processing_time FLOAT DEFAULT 0.0,
+                status VARCHAR DEFAULT 'processing',
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        
+        # Tabella contatti (da biglietti + manuali)
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS contacts (
+                id SERIAL PRIMARY KEY,
+                business_card_id VARCHAR REFERENCES business_cards(id),
+                nome VARCHAR NOT NULL,
+                cognome VARCHAR NOT NULL,
+                nome_completo VARCHAR GENERATED ALWAYS AS (nome || ' ' || cognome) STORED,
+                azienda VARCHAR,
+                posizione VARCHAR,
+                telefono VARCHAR,
+                cellulare VARCHAR,
+                email VARCHAR,
+                sito_web VARCHAR,
+                indirizzo TEXT,
+                linkedin VARCHAR,
+                note TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        
+        # Indici per performance
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_contacts_azienda ON contacts(azienda)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_contacts_nome_cognome ON contacts(nome, cognome)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_business_cards_status ON business_cards(status)"))
+        
+        db.commit()
+        print("✅ Tabelle business cards create/verificate")
+    except Exception as e:
+        print(f"❌ Errore setup tabelle: {e}")
+        db.rollback()
+
+def preprocess_image(image_bytes: bytes) -> str:
+    """Preprocessa l'immagine per OCR ottimale"""
+    try:
+        # Apri immagine
+        image = Image.open(io.BytesIO(image_bytes))
+        
+        # Converti in RGB se necessario
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Ridimensiona se troppo grande (max 2048px)
+        max_size = 2048
+        if image.width > max_size or image.height > max_size:
+            image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        
+        # Converti in base64
+        buffered = io.BytesIO()
+        image.save(buffered, format="JPEG", quality=95)
+        img_base64 = base64.b64encode(buffered.getvalue()).decode()
+        
+        return img_base64
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Errore preprocessing immagine: {str(e)}")
+
+def extract_business_card_data(image_base64: str) -> tuple[BusinessCardData, str, float]:
+    """Estrae dati dal biglietto usando OpenAI Vision"""
+    try:
+        import time
+        start_time = time.time()
+        
+        # Prompt ottimizzato per biglietti da visita
+        prompt = """
+Analizza questo biglietto da visita e estrai tutte le informazioni in formato JSON strutturato.
+
+ISTRUZIONI:
+- Identifica nome, cognome, azienda, posizione lavorativa
+- Estrai tutti i contatti: telefono, email, sito web
+- Trova indirizzo completo se presente  
+- Cerca profili social (LinkedIn, etc.)
+- Distingui tra telefono fisso e cellulare quando possibile
+- Se il testo è in lingua straniera, traduci i ruoli in italiano
+
+FORMATO RISPOSTA JSON:
+{
+  "nome": "string",
+  "cognome": "string", 
+  "nome_completo": "string",
+  "azienda": "string",
+  "posizione": "string",
+  "telefono": "string",
+  "cellulare": "string", 
+  "email": "string",
+  "sito_web": "string",
+  "indirizzo": "string",
+  "citta": "string",
+  "cap": "string",
+  "paese": "string",
+  "linkedin": "string",
+  "altri_social": {"facebook": "url", "twitter": "url"},
+  "note": "informazioni aggiuntive",
+  "confidence": 0.95
+}
+
+REGOLE:
+- Se un campo non è presente, usa null
+- Normalizza email in lowercase
+- Rimuovi spazi extra da telefoni
+- Per siti web, aggiungi https:// se mancante
+- Confidence da 0 a 1 basato sulla chiarezza dell'immagine
+"""
+        
+        response = client.chat.completions.create(
+            model="gpt-4o",  # Modello con vision
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}",
+                                "detail": "high"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=1500,
+            temperature=0.1
+        )
+        
+        # Estrai JSON dalla risposta
+        content = response.choices[0].message.content.strip()
+        
+        # Pulisci la risposta per estrarre JSON
+        if "```json" in content:
+            json_start = content.find("```json") + 7
+            json_end = content.find("```", json_start)
+            content = content[json_start:json_end].strip()
+        elif "```" in content:
+            json_start = content.find("```") + 3
+            json_end = content.find("```", json_start)
+            content = content[json_start:json_end].strip()
+        
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            # Fallback: prova a pulire e riparsare
+            content = content.replace('\n', '').replace('\r', '')
+            data = json.loads(content)
+        
+        # Estrai confidence
+        confidence = data.pop('confidence', 0.8)
+        
+        # Crea oggetto BusinessCardData
+        card_data = BusinessCardData(**data)
+        
+        processing_time = time.time() - start_time
+        
+        return card_data, content, confidence
+        
+    except Exception as e:
+        print(f"❌ Errore estrazione dati: {e}")
+        # Ritorna dati vuoti in caso di errore
+        return BusinessCardData(), f"Errore: {str(e)}", 0.0
+
+def clean_phone_number(phone: str) -> str:
+    """Pulisce e normalizza numero di telefono"""
+    if not phone:
+        return None
+    
+    # Rimuovi caratteri non numerici eccetto + e spazi
+    cleaned = re.sub(r'[^\d\+\s\-\(\)]', '', phone)
+    
+    # Normalizza formato italiano
+    cleaned = cleaned.replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+    
+    return cleaned if len(cleaned) >= 8 else None
+
+def clean_email(email: str) -> str:
+    """Pulisce e valida email"""
+    if not email:
+        return None
+    
+    email = email.lower().strip()
+    
+    # Regex base per validazione email
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    
+    if re.match(email_pattern, email):
+        return email
+    
+    return None
+
+@router.post("/analyze", response_model=BusinessCardResult)
+async def analyze_business_card(
+    file: UploadFile = File(...),
+    save_contact: bool = Form(True),
+    db: Session = Depends(get_db)
+):
+    """Analizza biglietto da visita e estrae dati"""
+    try:
+        # Setup tabelle
+        setup_business_cards_tables(db)
+        
+        # Validazione file
+        if file.size > MAX_IMAGE_SIZE:
+            raise HTTPException(status_code=413, detail="Immagine troppo grande (max 10MB)")
+        
+        if file.content_type not in SUPPORTED_FORMATS:
+            raise HTTPException(status_code=400, detail="Formato immagine non supportato (JPG, PNG, WEBP)")
+        
+        # Leggi e preprocessa immagine
+        image_bytes = await file.read()
+        image_base64 = preprocess_image(image_bytes)
+        
+        # Estrai dati con AI
+        card_data, raw_text, confidence = extract_business_card_data(image_base64)
+        processing_time = 2.5  # Approssimativo
+        
+        # Pulisci dati estratti
+        if card_data.telefono:
+            card_data.telefono = clean_phone_number(card_data.telefono)
+        if card_data.cellulare:
+            card_data.cellulare = clean_phone_number(card_data.cellulare)
+        if card_data.email:
+            card_data.email = clean_email(card_data.email)
+        
+        # Determina status
+        status = "success"
+        if confidence < 0.5:
+            status = "partial"
+        if not card_data.nome and not card_data.azienda:
+            status = "error"
+        
+        # Salva nel database
+        card_id = str(uuid.uuid4())
+        
+        db.execute(text("""
+            INSERT INTO business_cards 
+            (id, filename, image_data, extracted_data, raw_text, confidence_score, processing_time, status)
+            VALUES (:id, :filename, :image_data, :extracted_data, :raw_text, :confidence, :processing_time, :status)
+        """), {
+            "id": card_id,
+            "filename": file.filename,
+            "image_data": image_base64,
+            "extracted_data": json.dumps(card_data.dict()),
+            "raw_text": raw_text,
+            "confidence": confidence,
+            "processing_time": processing_time,
+            "status": status
+        })
+        
+        # Salva contatto se richiesto e dati sufficienti
+        if save_contact and card_data.nome and status != "error":
+            try:
+                db.execute(text("""
+                    INSERT INTO contacts 
+                    (business_card_id, nome, cognome, azienda, posizione, telefono, cellulare, email, sito_web, indirizzo, linkedin, note)
+                    VALUES (:card_id, :nome, :cognome, :azienda, :posizione, :telefono, :cellulare, :email, :sito_web, :indirizzo, :linkedin, :note)
+                """), {
+                    "card_id": card_id,
+                    "nome": card_data.nome or "N/A",
+                    "cognome": card_data.cognome or "",
+                    "azienda": card_data.azienda,
+                    "posizione": card_data.posizione,
+                    "telefono": card_data.telefono,
+                    "cellulare": card_data.cellulare,
+                    "email": card_data.email,
+                    "sito_web": card_data.sito_web,
+                    "indirizzo": card_data.indirizzo,
+                    "linkedin": card_data.linkedin,
+                    "note": card_data.note
+                })
+            except Exception as e:
+                print(f"⚠️ Errore salvataggio contatto: {e}")
+        
+        db.commit()
+        
+        return BusinessCardResult(
+            id=card_id,
+            filename=file.filename,
+            extracted_data=card_data,
+            confidence_score=confidence,
+            raw_text=raw_text,
+            processing_time=processing_time,
+            created_at=datetime.now(),
+            status=status
+        )
+        
+    except Exception as e:
+        db.rollback()
+        print(f"❌ Errore analisi biglietto: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/business_cards/history")
+def get_business_cards_history(
+    limit: int = 50,
+    status_filter: Optional[str] = None,
+    db: Session = Depends(get_db)
+) -> List[BusinessCardResult]:
+    """Recupera storico biglietti analizzati"""
+    try:
+        query = """
+            SELECT id, filename, extracted_data, confidence_score, raw_text, processing_time, created_at, status
+            FROM business_cards
+        """
+        params = {}
+        
+        if status_filter:
+            query += " WHERE status = :status"
+            params["status"] = status_filter
+        
+        query += " ORDER BY created_at DESC LIMIT :limit"
+        params["limit"] = limit
+        
+        result = db.execute(text(query), params)
+        
+        cards = []
+        for row in result.fetchall():
+            extracted_data = json.loads(row[2]) if row[2] else {}
+            cards.append(BusinessCardResult(
+                id=row[0],
+                filename=row[1],
+                extracted_data=BusinessCardData(**extracted_data),
+                confidence_score=row[3],
+                raw_text=row[4],
+                processing_time=row[5],
+                created_at=row[6],
+                status=row[7]
+            ))
+        
+        return cards
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/business_cards/contacts")
+def get_contacts(
+    search: Optional[str] = None,
+    azienda: Optional[str] = None,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+) -> List[Contact]:
+    """Recupera lista contatti"""
+    try:
+        query = """
+            SELECT id, nome, cognome, nome_completo, azienda, posizione, 
+                   telefono, email, created_at, business_card_id
+            FROM contacts
+        """
+        params = {}
+        conditions = []
+        
+        if search:
+            conditions.append("(nome ILIKE :search OR cognome ILIKE :search OR azienda ILIKE :search)")
+            params["search"] = f"%{search}%"
+        
+        if azienda:
+            conditions.append("azienda ILIKE :azienda")
+            params["azienda"] = f"%{azienda}%"
+        
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        
+        query += " ORDER BY created_at DESC LIMIT :limit"
+        params["limit"] = limit
+        
+        result = db.execute(text(query), params)
+        
+        contacts = []
+        for row in result.fetchall():
+            contacts.append(Contact(
+                id=row[0],
+                nome=row[1],
+                cognome=row[2],
+                nome_completo=row[3],
+                azienda=row[4],
+                posizione=row[5],
+                telefono=row[6],
+                email=row[7],
+                created_at=row[8],
+                business_card_id=row[9]
+            ))
+        
+        return contacts
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/contacts", response_model=Contact)
+def create_contact_manual(contact_data: ContactCreate, db: Session = Depends(get_db)):
+    """Crea contatto manualmente"""
+    try:
+        result = db.execute(text("""
+            INSERT INTO contacts 
+            (business_card_id, nome, cognome, azienda, posizione, telefono, email, note)
+            VALUES (:card_id, :nome, :cognome, :azienda, :posizione, :telefono, :email, :note)
+            RETURNING id, nome, cognome, nome_completo, azienda, posizione, telefono, email, created_at, business_card_id
+        """), {
+            "card_id": contact_data.business_card_id,
+            "nome": contact_data.nome,
+            "cognome": contact_data.cognome,
+            "azienda": contact_data.azienda,
+            "posizione": contact_data.posizione,
+            "telefono": contact_data.telefono,
+            "email": contact_data.email,
+            "note": contact_data.note
+        })
+        
+        row = result.fetchone()
+        db.commit()
+        
+        return Contact(
+            id=row[0],
+            nome=row[1],
+            cognome=row[2],
+            nome_completo=row[3],
+            azienda=row[4],
+            posizione=row[5],
+            telefono=row[6],
+            email=row[7],
+            created_at=row[8],
+            business_card_id=row[9]
+        )
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/business_cards/stats")
+def get_business_cards_stats(db: Session = Depends(get_db)):
+    """Statistiche biglietti da visita"""
+    try:
+        # Statistiche biglietti
+        cards_result = db.execute(text("""
+            SELECT 
+                COUNT(*) as total_cards,
+                COUNT(CASE WHEN status = 'success' THEN 1 END) as successful_cards,
+                AVG(confidence_score) as avg_confidence,
+                AVG(processing_time) as avg_processing_time
+            FROM business_cards
+        """))
+        
+        cards_stats = cards_result.fetchone()
+        
+        # Statistiche contatti
+        contacts_result = db.execute(text("""
+            SELECT 
+                COUNT(*) as total_contacts,
+                COUNT(DISTINCT azienda) as unique_companies,
+                COUNT(CASE WHEN email IS NOT NULL THEN 1 END) as contacts_with_email,
+                COUNT(CASE WHEN telefono IS NOT NULL THEN 1 END) as contacts_with_phone
+            FROM contacts
+        """))
+        
+        contacts_stats = contacts_result.fetchone()
+        
+        return {
+            "business_cards": {
+                "total": cards_stats[0] or 0,
+                "successful": cards_stats[1] or 0,
+                "avg_confidence": round(cards_stats[2] or 0, 2),
+                "avg_processing_time": round(cards_stats[3] or 0, 2)
+            },
+            "contacts": {
+                "total": contacts_stats[0] or 0,
+                "unique_companies": contacts_stats[1] or 0,
+                "with_email": contacts_stats[2] or 0,
+                "with_phone": contacts_stats[3] or 0
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/business_cards/cards/{card_id}")
+def delete_business_card(card_id: str, db: Session = Depends(get_db)):
+    """Elimina biglietto da visita"""
+    try:
+        result = db.execute(text("DELETE FROM business_cards WHERE id = :id"), {"id": card_id})
+        
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Biglietto non trovato")
+        
+        db.commit()
+        return {"message": "Biglietto eliminato"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/business_cards/contacts/{contact_id}")
+def delete_contact(contact_id: int, db: Session = Depends(get_db)):
+    """Elimina contatto"""
+    try:
+        result = db.execute(text("DELETE FROM contacts WHERE id = :id"), {"id": contact_id})
+        
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Contatto non trovato")
+        
+        db.commit()
+        return {"message": "Contatto eliminato"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))

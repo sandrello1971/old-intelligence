@@ -1,0 +1,288 @@
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from app.core.database import get_db
+from app.models.sub_type import SubType
+from app.models.milestone import Milestone  
+from app.models.phase_template import PhaseTemplate
+from app.models.service_user_association import ServiceUserAssociation
+from app.models.user import User
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel
+import logging
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/services-tree", tags=["Services Tree"])
+
+class MilestoneCreate(BaseModel):
+    name: str
+    order: int
+    sla_days: Optional[int] = 5
+    warning_days: Optional[int] = 2
+    escalation_days: Optional[int] = 3
+
+class TaskTemplateCreate(BaseModel):
+    code: str
+    type: str
+    description: str
+    order: Optional[int] = 1
+
+@router.get("/")
+async def get_services_tree(db: Session = Depends(get_db)):
+    """Restituisce l'alberatura completa dei servizi CON UTENTI"""
+    try:
+        services = db.query(SubType).all()
+        result = []
+        
+        for service in services:
+            # AGGIUNGO SOLO GLI UTENTI ASSEGNATI
+            user_assignments = db.query(ServiceUserAssociation).filter(
+                ServiceUserAssociation.service_id == service.id
+            ).all()
+            
+            assigned_users = []
+            for assignment in user_assignments:
+                user = db.query(User).filter(User.id == assignment.user_id).first()
+                if user:
+                    assigned_users.append({
+                        "user_id": assignment.user_id,
+                        "email": user.email,
+                        "display_name": f"{user.name} {user.surname}".strip(),
+                        "role": assignment.role
+                    })
+            
+            milestones = db.query(Milestone).filter(
+                Milestone.project_type == service.code
+            ).order_by(Milestone.order).all()
+            
+            milestones_data = []
+            for milestone in milestones:
+                task_templates = db.query(PhaseTemplate).filter(
+                    PhaseTemplate.milestone_id == milestone.id
+                ).order_by(PhaseTemplate.order).all()
+                
+                milestone_data = {
+                    "id": milestone.id,
+                    "name": milestone.name,
+                    "order": milestone.order,
+                    "project_type": milestone.project_type,
+                    "sla_days": 5,
+                    "warning_days": 2, 
+                    "escalation_days": 3,
+                    "task_templates": [
+                        {
+                            "id": template.id,
+                            "code": template.code,
+                            "type": template.type,
+                            "description": template.description,
+                            "order": getattr(template, 'order', 0),
+                            "parent_id": getattr(template, 'parent_id', None)
+                        }
+                        for template in task_templates
+                    ]
+                }
+                milestones_data.append(milestone_data)
+            
+            service_data = {
+                "id": service.id,
+                "name": service.name,
+                "code": service.code,
+                "description": getattr(service, 'description', ''),
+                "active": getattr(service, 'active', True),
+                "assigned_users": assigned_users,  # ← AGGIUNTO UTENTI
+                "milestones": milestones_data
+            }
+            result.append(service_data)
+        
+        logger.info(f"✅ Caricati {len(result)} servizi con utenti")
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Errore: {e}")
+        return []
+
+@router.get("/users")
+async def get_users(db: Session = Depends(get_db)):
+    """Lista utenti disponibili"""
+    try:
+        users = db.query(User).all()
+        return [
+            {
+                "id": user.id,
+                "email": user.email,
+                "display_name": f"{user.name} {user.surname}".strip(),
+                "role": "user"
+            }
+            for user in users
+        ]
+    except Exception as e:
+        logger.error(f"❌ Errore users: {e}")
+        return []
+
+@router.get("/health")
+async def health_check():
+    """Health check"""
+    return {
+        "status": "ok", 
+        "message": "Services Tree con utenti - BASE FUNZIONANTE",
+        "endpoints": [
+            "GET / - Lista servizi con utenti",
+            "GET /users - Lista utenti"
+        ]
+    }
+
+@router.delete("/services/{service_id}")
+def delete_service(service_id: int, db: Session = Depends(get_db)):
+    """Elimina un servizio CON CONTROLLI DI SICUREZZA"""
+    try:
+        # 1. Trova il servizio
+        service = db.query(SubType).filter(SubType.id == service_id).first()
+        if not service:
+            raise HTTPException(status_code=404, detail="Servizio non trovato")
+        
+        # 2. CONTROLLO: Verifica se ha ticket attivi
+        from app.models.ticket import Ticket
+        tickets_count = db.query(Ticket).filter(Ticket.ticket_code.like(f"TCK-{service.code}%")).count()
+        if tickets_count > 0:
+            raise HTTPException(status_code=400, detail=f"Impossibile eliminare: servizio ha {tickets_count} ticket attivi")
+        
+        # 3. Elimina prima le associazioni utente-servizio
+        associations_deleted = db.query(ServiceUserAssociation).filter(ServiceUserAssociation.service_id == service_id).delete()
+        
+        # 4. Elimina il servizio
+        service_name = service.name
+        db.delete(service)
+        db.commit()
+        
+        return {
+            "message": f"Servizio '{service_name}' eliminato con successo",
+            "associations_deleted": associations_deleted,
+            "tickets_checked": tickets_count
+        }
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Errore eliminazione servizio {service_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Errore interno: {str(e)}")
+
+@router.post("/services/{service_id}/users")
+def assign_user_to_service(service_id: int, request: dict, db: Session = Depends(get_db)):
+    """Assegna/rimuove utente da servizio"""
+    try:
+        user_id = request.get("user_id")
+        action = request.get("action", "assign")  # assign o remove
+        
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id richiesto")
+        
+        # Verifica esistenza servizio e utente
+        service = db.query(SubType).filter(SubType.id == service_id).first()
+        user = db.query(User).filter(User.id == user_id).first()
+        
+        if not service:
+            raise HTTPException(status_code=404, detail="Servizio non trovato")
+        if not user:
+            raise HTTPException(status_code=404, detail="Utente non trovato")
+        
+        if action == "assign":
+            # Controlla se associazione già exists
+            existing = db.query(ServiceUserAssociation).filter(
+                ServiceUserAssociation.service_id == service_id,
+                ServiceUserAssociation.user_id == user_id
+            ).first()
+            
+            if existing:
+                return {"message": "Utente già assegnato al servizio"}
+            
+            # Crea nuova associazione
+            association = ServiceUserAssociation(service_id=service_id, user_id=user_id)
+            db.add(association)
+            message = f"Utente {user.name} {user.surname} assegnato a {service.name}"
+            
+        elif action == "remove":
+            # Rimuovi associazione
+            deleted = db.query(ServiceUserAssociation).filter(
+                ServiceUserAssociation.service_id == service_id,
+                ServiceUserAssociation.user_id == user_id
+            ).delete()
+            
+            if deleted == 0:
+                raise HTTPException(status_code=404, detail="Associazione non trovata")
+            
+            message = f"Utente {user.name} {user.surname} rimosso da {service.name}"
+        
+        db.commit()
+        return {"message": message, "action": action}
+        
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Errore gestione user-service {service_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/services")
+def create_service(request: dict, db: Session = Depends(get_db)):
+    """Crea un nuovo servizio"""
+    try:
+        name = request.get("name")
+        code = request.get("code") 
+        
+        if not name or not code:
+            raise HTTPException(status_code=400, detail="Nome e codice richiesti")
+        
+        # Controlla se il codice esiste già
+        existing = db.query(SubType).filter(SubType.code == code).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Codice servizio già esistente")
+        
+        # Crea nuovo servizio
+        service = SubType(
+            name=name,
+            code=code,
+            # description removed
+        )
+        
+        db.add(service)
+        db.commit()
+        db.refresh(service)
+        
+        return {"message": f"Servizio {name} creato con successo", "service": service}
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Errore creazione servizio: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/services/{service_id}/users/{user_id}")
+async def remove_user_from_service(
+    service_id: int,
+    user_id: str,
+    db: Session = Depends(get_db)
+):
+    """Rimuove utente da servizio"""
+    try:
+        # Rimuovi associazione utente-servizio
+        association = db.query(ServiceUserAssociation).filter(
+            ServiceUserAssociation.service_id == service_id,
+            ServiceUserAssociation.user_id == user_id
+        ).first()
+        
+        if not association:
+            raise HTTPException(status_code=404, detail="Association not found")
+        
+        db.delete(association)
+        db.commit()
+        
+        return {"message": f"User {user_id} removed from service {service_id}"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error removing user: {str(e)}")

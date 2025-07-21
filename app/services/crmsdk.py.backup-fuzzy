@@ -1,0 +1,80 @@
+import os
+import requests
+from integrations.crm_incloud.sync import get_crm_token
+from sqlalchemy import func
+from app.models.company import Company
+
+CRM_API_KEY = os.getenv("CRM_API_KEY")
+CRM_BASE_URL = "https://api.crmincloud.it/api/v1"
+
+
+def create_crm_activity(data: dict) -> int:
+    """
+    Crea un'attività Ulisse nel CRM e restituisce l'ID creato.
+    """
+    token = get_crm_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "WebApiKey": CRM_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    # Costruzione payload con casting sicuro ai tipi corretti
+    payload = {
+        "subject": data.get("subject"),
+        "title": f"Incarico 24 Mesi - {data.get('customer_name', 'N/A')}",
+        "description": data.get("description"),
+        "sub_type_id": int(data.get("subTypeId", 63705)),
+        "status": "aperta",
+        "priority": int(data.get("priority", 0)),
+        "ownerId": int(data.get("ownerId")),
+        "companyId": int(data.get("companyId")),
+        "type": int(data.get("type", 7)),
+        "activityDate": data.get("activityDate"),
+        "activityEndDate": data.get("activityEndDate"),
+        "idCompanion": int(data.get("idCompanion"))
+    }
+
+    url = f"{CRM_BASE_URL}/Activity/CreateOrUpdate"
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        response_data = response.json()
+
+        # 👉 Log completo della risposta
+        print(">>> JSON completo risposta CRM:", response_data)
+
+        if isinstance(response_data, int):
+            return response_data
+        elif isinstance(response_data, dict) and "id" in response_data:
+            return response_data["id"]
+        else:
+            raise ValueError(f"Risposta CRM non contiene un ID valido: {response_data}")
+    except requests.HTTPError as http_err:
+        raise RuntimeError(f"HTTPError creazione attività: {http_err}\nRisposta: {response.text}") from http_err
+    except Exception as e:
+        raise RuntimeError(f"Errore generico creazione attività: {e}") from e
+
+
+from sqlalchemy import text
+
+def get_company_id_by_name(company_name: str, db):
+    from sqlalchemy import func
+
+    if not company_name:
+        return None
+
+    normalized = company_name.strip().lower().replace("-", "").replace(" ", "")
+    candidates = (
+        db.query(Company.id, Company.nome)
+        .all()
+    )
+
+    for company_id, nome in candidates:
+        nome_norm = nome.strip().lower().replace("-", "").replace(" ", "")
+        if normalized in nome_norm:
+            print(f"[DEBUG] Match trovato: input='{company_name}' vs db='{nome}'")
+            return company_id
+
+    print(f"[DEBUG] Nessun match per: {company_name}")
+    return None
